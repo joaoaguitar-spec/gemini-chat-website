@@ -1,20 +1,134 @@
+import os
+import ast
+import operator as op
+from datetime import datetime
 from flask import Flask, request, jsonify, render_template_string
 from google import genai
-import os
 
 app = Flask(__name__)
 
-# Read the Gemini API key from your environment.
-# In PowerShell, set it like this before running the app:
-# $env:GEMINI_API_KEY="your_real_key_here"
 API_KEY = os.environ.get("GEMINI_API_KEY")
 if not API_KEY:
     raise RuntimeError(
-        "GEMINI_API_KEY is not set. In PowerShell, run: $env:GEMINI_API_KEY=\"your_real_key_here\""
+        'GEMINI_API_KEY is not set. In Render, add it as an environment variable.'
     )
 
 client = genai.Client(api_key=API_KEY)
 chat = client.chats.create(model="gemini-2.5-flash")
+
+# -----------------------------
+# Tiny beginner agent tools
+# -----------------------------
+
+ALLOWED_OPERATORS = {
+    ast.Add: op.add,
+    ast.Sub: op.sub,
+    ast.Mult: op.mul,
+    ast.Div: op.truediv,
+    ast.Pow: op.pow,
+    ast.USub: op.neg,
+    ast.Mod: op.mod,
+}
+
+
+def safe_eval(expr: str):
+    """Safely evaluate basic math like 2+2, (5*3)-1, 2**8."""
+
+    def _eval(node):
+        if isinstance(node, ast.Constant):
+            if isinstance(node.value, (int, float)):
+                return node.value
+            raise ValueError("Only numbers are allowed.")
+        if isinstance(node, ast.BinOp):
+            if type(node.op) not in ALLOWED_OPERATORS:
+                raise ValueError("That math operator is not allowed.")
+            return ALLOWED_OPERATORS[type(node.op)](_eval(node.left), _eval(node.right))
+        if isinstance(node, ast.UnaryOp):
+            if type(node.op) not in ALLOWED_OPERATORS:
+                raise ValueError("That unary operator is not allowed.")
+            return ALLOWED_OPERATORS[type(node.op)](_eval(node.operand))
+        raise ValueError("Invalid math expression.")
+
+    tree = ast.parse(expr, mode="eval")
+    return _eval(tree.body)
+
+
+def run_tool(tool_name: str, tool_input: str):
+    if tool_name == "time":
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        return f"Current server time: {now}"
+
+    if tool_name == "calculator":
+        result = safe_eval(tool_input)
+        return f"Calculator result: {result}"
+
+    return f"Unknown tool: {tool_name}"
+
+
+def agent_reply(user_message: str) -> str:
+    """
+    A tiny agent loop:
+    1. Ask Gemini whether to answer directly or use a tool
+    2. If tool needed, run it in Python
+    3. Ask Gemini to produce the final answer
+    """
+    planner_prompt = f"""
+You are a tiny beginner AI agent.
+
+You have 2 tools:
+1. time -> use for current date/time questions
+2. calculator -> use for arithmetic like 2+2, 15*7, (8+4)/2
+
+Decide the NEXT step only.
+
+Reply in EXACTLY ONE of these formats:
+
+REPLY: <your direct reply>
+TOOL: <tool_name> | <tool_input>
+
+Rules:
+- Use time only for time/date questions.
+- Use calculator only for arithmetic.
+- For anything else, use REPLY.
+- Do not explain the format.
+
+User message: {user_message}
+""".strip()
+
+    plan_response = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=planner_prompt,
+    )
+
+    plan_text = (plan_response.text or "").strip()
+
+    if plan_text.startswith("TOOL:"):
+        try:
+            tool_part = plan_text[len("TOOL:"):].strip()
+            tool_name, tool_input = [x.strip() for x in tool_part.split("|", 1)]
+            tool_result = run_tool(tool_name, tool_input)
+        except Exception as e:
+            return f"I tried to use a tool, but something went wrong: {e}"
+
+        final_prompt = f"""
+You are a helpful assistant.
+The user asked: {user_message}
+You used the tool '{tool_name}'.
+Tool result: {tool_result}
+
+Now answer the user naturally and clearly.
+""".strip()
+
+        final_response = chat.send_message(final_prompt)
+        return final_response.text
+
+    if plan_text.startswith("REPLY:"):
+        return plan_text[len("REPLY:"):].strip()
+
+    # Fallback if Gemini does not follow the format exactly
+    fallback_response = chat.send_message(user_message)
+    return fallback_response.text
+
 
 HTML = """
 <!doctype html>
@@ -22,14 +136,13 @@ HTML = """
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>My Gemini Chat</title>
+  <title>My Gemini Agent</title>
   <style>
     :root {
       --bg-1: #020617;
       --bg-2: #0f172a;
       --panel: rgba(15, 23, 42, 0.82);
       --panel-strong: rgba(15, 23, 42, 0.96);
-      --panel-soft: rgba(30, 41, 59, 0.72);
       --text: #e5eefc;
       --muted: #94a3b8;
       --accent: #38bdf8;
@@ -41,7 +154,6 @@ HTML = """
     }
 
     * { box-sizing: border-box; }
-
     html, body {
       margin: 0;
       min-height: 100%;
@@ -136,8 +248,7 @@ HTML = """
       flex-direction: column;
       gap: 16px;
       scroll-behavior: smooth;
-      background:
-        linear-gradient(180deg, rgba(2, 6, 23, 0.18), rgba(2, 6, 23, 0.32));
+      background: linear-gradient(180deg, rgba(2, 6, 23, 0.18), rgba(2, 6, 23, 0.32));
     }
 
     .row {
@@ -147,9 +258,7 @@ HTML = """
       animation: fadeInUp 0.22s ease;
     }
 
-    .row.user-row {
-      justify-content: flex-end;
-    }
+    .row.user-row { justify-content: flex-end; }
 
     .avatar {
       width: 36px;
@@ -159,7 +268,6 @@ HTML = """
       place-items: center;
       flex-shrink: 0;
       font-size: 16px;
-      box-shadow: 0 8px 20px rgba(15, 23, 42, 0.35);
     }
 
     .bot-avatar {
@@ -220,7 +328,6 @@ HTML = """
       border-radius: 22px;
       background: rgba(2, 6, 23, 0.42);
       border: 1px solid rgba(56, 189, 248, 0.16);
-      box-shadow: inset 0 1px 0 rgba(255,255,255,0.03);
     }
 
     #messageInput {
@@ -238,10 +345,6 @@ HTML = """
       font-family: inherit;
     }
 
-    #messageInput::placeholder {
-      color: #7c8aa5;
-    }
-
     .send-btn {
       min-width: 112px;
       border: none;
@@ -251,19 +354,6 @@ HTML = """
       font-weight: 700;
       font-size: 15px;
       cursor: pointer;
-      box-shadow: 0 12px 28px rgba(56, 189, 248, 0.28);
-      transition: transform 0.15s ease, filter 0.15s ease, opacity 0.15s ease;
-    }
-
-    .send-btn:hover {
-      transform: translateY(-1px);
-      filter: brightness(1.04);
-    }
-
-    .send-btn:disabled {
-      opacity: 0.7;
-      cursor: not-allowed;
-      transform: none;
     }
 
     .footer-row {
@@ -316,18 +406,6 @@ HTML = """
       from { opacity: 0; transform: translateY(8px); }
       to { opacity: 1; transform: translateY(0); }
     }
-
-    @media (max-width: 720px) {
-      body { padding: 10px; }
-      .app { height: 94vh; border-radius: 22px; }
-      .header { padding: 18px; align-items: flex-start; flex-direction: column; }
-      .badge { align-self: flex-start; }
-      .chat-box { padding: 18px; }
-      .bubble-wrap { max-width: 88%; }
-      .input-shell { flex-direction: column; }
-      .send-btn { min-height: 52px; }
-      .footer-row { flex-direction: column; align-items: flex-start; }
-    }
   </style>
 </head>
 <body>
@@ -336,19 +414,19 @@ HTML = """
       <div class="brand">
         <div class="logo">✦</div>
         <div class="title-wrap">
-          <h1>My Gemini Chat</h1>
-          <p>A tiny local AI website built with Python + Flask + Gemini.</p>
+          <h1>My Gemini Agent</h1>
+          <p>My first tiny AI agent with tools.</p>
         </div>
       </div>
-      <div class="badge">Remembers while open</div>
+      <div class="badge">Tools: time + calculator</div>
     </div>
 
     <div id="chatBox" class="chat-box">
       <div class="row bot-row bot">
         <div class="avatar bot-avatar">🤖</div>
         <div class="bubble-wrap">
-          <div class="meta">Gemini</div>
-          <div class="message">Hi! I remember earlier messages while this app is running. Ask me anything.</div>
+          <div class="meta">Agent</div>
+          <div class="message">Hi! I am your first tiny AI agent. I can chat, do math, and check the server time.</div>
         </div>
       </div>
 
@@ -364,7 +442,7 @@ HTML = """
 
     <div class="composer">
       <div class="input-shell">
-        <textarea id="messageInput" placeholder="Message Gemini..."></textarea>
+        <textarea id="messageInput" placeholder="Try: what time is it? or calculate (12*8)+5"></textarea>
         <button id="sendButton" class="send-btn">Send</button>
       </div>
       <div class="footer-row">
@@ -387,7 +465,7 @@ HTML = """
 
     function setTyping(show) {
       typingRow.style.display = show ? 'flex' : 'none';
-      statusText.textContent = show ? 'Gemini is thinking...' : 'Ready';
+      statusText.textContent = show ? 'Agent is thinking...' : 'Ready';
       scrollToBottom();
     }
 
@@ -404,7 +482,7 @@ HTML = """
 
       const meta = document.createElement('div');
       meta.className = 'meta';
-      meta.textContent = sender === 'user' ? 'You' : 'Gemini';
+      meta.textContent = sender === 'user' ? 'You' : 'Agent';
 
       const bubble = document.createElement('div');
       bubble.className = 'message';
@@ -426,7 +504,6 @@ HTML = """
       addMessage(text, 'user');
       messageInput.value = '';
       sendButton.disabled = true;
-      messageInput.style.height = '58px';
       setTyping(true);
 
       try {
@@ -437,7 +514,6 @@ HTML = """
         });
 
         const data = await response.json();
-
         setTyping(false);
 
         if (!response.ok) {
@@ -453,11 +529,6 @@ HTML = """
         messageInput.focus();
       }
     }
-
-    messageInput.addEventListener('input', () => {
-      messageInput.style.height = '58px';
-      messageInput.style.height = Math.min(messageInput.scrollHeight, 180) + 'px';
-    });
 
     sendButton.addEventListener('click', sendMessage);
 
@@ -489,8 +560,8 @@ def chat_route():
         return jsonify({"error": "Message cannot be empty."}), 400
 
     try:
-        response = chat.send_message(user_message)
-        return jsonify({"reply": response.text})
+        reply = agent_reply(user_message)
+        return jsonify({"reply": reply})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -498,3 +569,4 @@ def chat_route():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+ should I chagne anything now?  +#+#+#+#+#+assistant to=canmore.update_textdoc კომენტary  大发扑克json{Jsiiupdates:[{
